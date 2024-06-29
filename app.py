@@ -1,57 +1,81 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
-import face_recognition
 import cv2
-import os
+import face_recognition
+import numpy as np
+from minio import Minio
+from minio.error import S3Error
+from PIL import Image
+import io
 
 app = Flask(__name__)
-CORS(app)  
-reference_images_dir = "images/"
 
-known_face_encodings = []
-known_face_names = []
+minio_client = Minio(
+    "bucket-production-e5ac.up.railway.app:443",
+    access_key="DbzPDe4KUIr9zJcV62FJ",
+    secret_key="PeGICqOrGUr9YeeYE5z0QA1qXAYhQMn5AMFW7Pfd",
+    secure=True
+)
 
-for image_name in os.listdir(reference_images_dir):
-    image_path = os.path.join(reference_images_dir, image_name)
-    image = cv2.imread(image_path)
-    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    encodings = face_recognition.face_encodings(rgb_image)
-    if len(encodings) > 0:
-        known_face_encodings.append(encodings[0])
-        known_face_names.append(image_name)
+bucket_name = "imagesusers"
 
-@app.route('/identify', methods=['POST'])
-def identify():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
+def convert_image_to_rgb(image_file):
+    image = Image.open(image_file).convert('RGB')
+    return np.array(image)
 
+def get_image_from_minio(email):
+    try:
+        response = minio_client.get_object(bucket_name, f"{email}.jpg")
+        image_data = response.read()
+        image = Image.open(io.BytesIO(image_data)).convert('RGB')
+        return np.array(image)
+    except S3Error as e:
+        print(f"Error fetching image for {email}: {e}")
+        return None
+
+@app.route('/recognize', methods=['POST'])
+def recognize():
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
+    email = request.form['email']
+    if not file or not email:
+        return jsonify({"error": "No file or email provided"}), 400
 
-    image = face_recognition.load_image_file(file)
-    encodings = face_recognition.face_encodings(image)
+    try:
+        # Convert the uploaded image to RGB format
+        uploaded_image = convert_image_to_rgb(file)
 
-    if len(encodings) == 0:
-        return jsonify({"error": "No faces found in the image"}), 400
+        # Get the stored image from Minio
+        stored_image = get_image_from_minio(email)
+        if stored_image is None:
+            return jsonify({"error": f"No image found for {email}"}), 404
 
-    image_to_compare_encoding = encodings[0]
-    best_match_index = None
-    best_match_distance = float('inf')
-    for i, known_face_encoding in enumerate(known_face_encodings):
-        distance = face_recognition.face_distance([known_face_encoding], image_to_compare_encoding)[0]
-        if distance < best_match_distance:
-            best_match_distance = distance
-            best_match_index = i
+        # Get face encodings for both images
+        uploaded_face_locations = face_recognition.face_locations(uploaded_image)
+        uploaded_face_encodings = face_recognition.face_encodings(uploaded_image, uploaded_face_locations)
 
-    if best_match_index is not None:
-        result = {
-            "name": known_face_names[best_match_index],
-            "distance": best_match_distance
-        }
-        return jsonify(result), 200
-    else:
-        return jsonify({"error": "No match found"}), 400
+        stored_face_locations = face_recognition.face_locations(stored_image)
+        stored_face_encodings = face_recognition.face_encodings(stored_image, stored_face_locations)
+
+        if not uploaded_face_encodings or not stored_face_encodings:
+            return jsonify({"error": "No face found in one of the images"}), 400
+
+        response = []
+
+        for uploaded_face_encoding in uploaded_face_encodings:
+            matches = face_recognition.compare_faces(stored_face_encodings, uploaded_face_encoding)
+            name = "Unknown"
+
+            face_distances = face_recognition.face_distance(stored_face_encodings, uploaded_face_encoding)
+            best_match_index = np.argmin(face_distances)
+            if matches[best_match_index]:
+                name = email
+                response.append({"status": "success", "email": email})
+            else:
+                response.append({"status": "error", "email": email})
+
+        return jsonify(response)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
